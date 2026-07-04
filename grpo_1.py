@@ -31,7 +31,7 @@ G=8
 E=0.25
 beta=0.04
 
-optimizer=torch.optim.Adam(model.parameters(),lr=1e-5)
+optimizer=torch.optim.Adam(model.parameters(),lr=1e-6)
 pad_id= tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
 
 def per_token_logps(model,input_ids,attention_mask):
