@@ -2,38 +2,43 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import random
+import re
+from peft import get_peft_model, LoraConfig
+
+
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("device:", device)
 
-
-prompts=[
-    "what is neural network?",
-    "Count to three",
-    "Name a fruit",
-    "what is 5+4?",
-    "tell me about india in 30 words"
-]
-
 name="Qwen/Qwen2.5-1.5B-Instruct"
 tok=AutoTokenizer.from_pretrained(name)
 model=AutoModelForCausalLM.from_pretrained(name).to(device)
-model.train()
+
+lora_config = LoraConfig(
+    r=16,                        # rank — higher = more capacity, more memory
+    lora_alpha=32,               # scaling factor, usually 2×r
+    target_modules=["q_proj", "v_proj"],   # which attention layers to adapt
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
+
 
 ref_model=AutoModelForCausalLM.from_pretrained(name,torch_dtype=torch.bfloat16).to(device)
 ref_model.eval()
 for p in ref_model.parameters():
-    p.requires_grad=False
+    p.requires_grad_(False)
 
 epochs=4
 G=8
 E=0.25
-beta=0.04
+beta=0.1
 reward_log=[]
 
-optimizer=torch.optim.Adam(model.parameters(),lr=1e-6)
+optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-6)
 pad_id= tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-
 
 def per_token_logps(model,input_ids,attention_mask):
     outputs=model(input_ids=input_ids,attention_mask=attention_mask)
@@ -42,9 +47,53 @@ def per_token_logps(model,input_ids,attention_mask):
     logps=F.log_softmax(logits,dim=-1)
     return torch.gather(logps,dim=-1,index=targets.unsqueeze(-1)).squeeze(-1)
 
-def reward_fn(text:str)->float:
-    no_token=len(tok(text)["input_ids"])
-    return 1.0 if no_token>55 else 0.0
+
+
+
+def reward_fn(completion:str,numbers:list,target:int)->float:
+    format_reward=0.0
+    correctness_reward=0.0
+    match = re.search(r'<answer>(.*?)</answer>', completion, re.DOTALL)
+
+    if match:
+        format_reward=0.2
+        
+        # All of this must be tucked inside the 'if match' block
+        expr = match.group(1).strip()
+        try:
+            result=eval(expr)
+            if abs(result-target)<1e-6:
+                used = [int(x) for x in re.findall(r'\d+', expr)]
+                avail = sorted(numbers)
+                if sorted(used) == avail:
+                    correctness_reward = 1.0
+        except:
+            pass
+
+    return format_reward+correctness_reward
+
+
+def make_prompt(numbers:list,target:int)->str:
+    return(
+        f"Using the numbers {numbers} ,create an arithematic equation"
+        f"that equals {target}"
+        f"You may use +, -, *, / and each number at most once."
+        f"write your answer in <think>...</think><answer>...</answer>tags."
+    )
+
+import random
+
+def generate_problem():
+    numbers = random.sample(range(1, 10), 4)   
+    a, b, c, d = numbers
+    candidates = [
+        a + b, a - b, a * b,
+        a + b + c, a + b - c, a * b + c,
+        a + b + c + d, a * b + c - d,
+        a * b * c, a + b * c,
+    ]
+    target = random.choice([t for t in candidates if 1 <= t <= 100])
+    return numbers, target
 
 def compute_advantages(rewards):
     if rewards.std()<1e-8:
@@ -55,7 +104,7 @@ def cal_k1(new_policy,ref_policy):
     diff=(ref_policy-new_policy)
     return torch.exp(diff)-diff-1
 
-def rollout(model,prompt):
+def rollout(model,prompt,numbers,target):
     text=tok.apply_chat_template([{"role":"user","content":prompt}],tokenize=False,add_generation_prompt=True)
     inputs=tok(text,return_tensors="pt").to(device)
     prompt_len=inputs["input_ids"].shape[1]
@@ -76,7 +125,7 @@ def rollout(model,prompt):
     rewards=[]
     for i in range(G):
         comp=tok.decode(full_ids[i,prompt_len:],skip_special_tokens=True)
-        rewards.append(reward_fn(comp))
+        rewards.append(reward_fn(comp,numbers,target))
     rewards=torch.tensor(rewards,device=device)
 
     return full_ids, full_masks, completion_mask, rewards, old_seq_logp, ref_logp
@@ -111,8 +160,9 @@ def update(model, optimizer, full_ids, full_masks, completion_mask, old_seq_logp
 
 def train(n_steps=50):
     for step in range(n_steps):
-        prompt=random.choice(prompts)
-        full_ids, full_mask, completion_mask, rewards, old_seq_logp, ref_logp=rollout(model, prompt)
+        numbers,target=generate_problem()
+        prompt=make_prompt(numbers,target)
+        full_ids, full_mask, completion_mask, rewards, old_seq_logp, ref_logp=rollout(model, prompt,numbers,target)
         advantages=compute_advantages(rewards)
         if advantages is None:
             print(f"step {step:3d} | skipped (uniform rewards)")
@@ -128,19 +178,9 @@ def train(n_steps=50):
                   f"ratio {metrics['ratio_mean']:.4f} | "
                   f"kl {metrics['kl_mean']:.4f}")
 
+
+print(torch.cuda.memory_allocated() / 1e9, "GB allocated")
+print(torch.cuda.memory_reserved() / 1e9, "GB reserved")
+
+
 train()
-
-''' Rollout/update loop skeleton. Separated into three clean phases: rollout() (data collection, no grad),
- compute_advantages() (with uniform-reward skip guard), update() (K optimization epochs, returns metrics dict). 
- Skip guard working correctly — ~70% of steps skipped due to uniform rewards on easy prompts. Root cause: length reward 
- saturates too quickly on short-answer prompts. Fix: verifiable reward (Day 11). Loop mechanics confirmed correct on non-skipped
-   steps: ratio stable (1.0–1.4), KL small and growing slowly, grad clipping active.'''
-
-
-
-
-
-
-
-
-
