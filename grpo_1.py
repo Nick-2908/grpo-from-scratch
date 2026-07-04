@@ -1,20 +1,30 @@
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import random
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("device:", device)
 
+
+prompts=[
+    "what is neural network?",
+    "Count to three",
+    "Name a fruit",
+    "what is 5+4?",
+    "tell me about india in 30 words"
+]
+
 name="Qwen/Qwen2.5-0.5B-Instruct"
 tok=AutoTokenizer.from_pretrained(name)
 
-model=AutoModelForCausalLM.from_pretrained(name)
+model=AutoModelForCausalLM.from_pretrained(name).to(device)
 model.train()
 
-ref_model=AutoModelForCausalLM.from_pretrained(name)
+ref_model=AutoModelForCausalLM.from_pretrained(name).to(device)
 ref_model.eval()
 for p in ref_model.parameters():
-    p.requires_grad(False)
+    p.requires_grad=False
 
 epochs=4
 G=8
@@ -26,21 +36,23 @@ pad_id= tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
 
 def per_token_logps(model,input_ids,attention_mask):
     outputs=model(input_ids=input_ids,attention_mask=attention_mask)
-    logits=outputs.logits[:,:-1,]
+    logits=outputs.logits[:,:-1,:]
     targets=input_ids[:,1:]
     logps=F.log_softmax(logits,dim=-1)
     return torch.gather(logps,dim=-1,index=targets.unsqueeze(-1)).squeeze(-1)
 
 def reward_fn(text:str)->float:
     no_token=len(tok(text)["input_ids"])
-    return 1.0 if no_token>80 else 0.0
+    return 1.0 if no_token>60 else 0.0
 
-def cal_k1(new_policy,old_policy):
-    diff=new_policy-old_policy
+def cal_k1(new_policy,ref_policy):
+    diff=ref_policy-new_policy
     return torch.exp(diff)-diff-1
 
-def train_steps():
-    text=tok.apply_chat_template([{"role":"user","content":"what is neural network explain in 20 words"}],tokenize=False,add_generation_prompt=True)
+reward_log=[]
+
+def train_steps(prompt,step):
+    text=tok.apply_chat_template([{"role":"user","content":prompt}],tokenize=False,add_generation_prompt=True)
     inputs=tok(text,return_tensors="pt").to(device)
     prompt_len=inputs["input_ids"].shape[1]
 
@@ -48,9 +60,9 @@ def train_steps():
         full_ids=model.generate(**inputs,do_sample=True,max_new_tokens=65,temperature=0.8,num_return_sequences=G, pad_token_id=pad_id)
         full_mask=(full_ids!=pad_id).long()
 
-    completion_mask=torch.zeros_like(full_ids)
-    completion_mask=completion_mask[:,prompt_len:]=1
-    completion_mask=(completion_mask*full_mask)[:,1:]
+    completion_mask = torch.zeros_like(full_ids)
+    completion_mask[:, prompt_len:] = 1
+    completion_mask = (completion_mask * full_mask)[:, 1:]
 
     with torch.no_grad():
         old_logp=per_token_logps(model,full_ids,full_mask)
@@ -63,6 +75,7 @@ def train_steps():
         rewards.append(reward_fn(comp))
     rewards=torch.tensor(rewards,device=device)
     advantage = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+    reward_log.append(rewards.mean().item())
 
     for epoch in range(epochs):
         new_logp=per_token_logps(model,full_ids,full_mask)
@@ -78,14 +91,30 @@ def train_steps():
 
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
         optimizer.step()
-        print(f"epoch {epoch} | loss {loss.item():8.4f} | ratio mean {ratio.mean().item():.4f} | kl mean {kl.mean().item():.4f}")
-        print(f"step rewards: {rewards.tolist()}")
-        print(f"step advantage: {advantage.tolist()}")
+       
+        print(f"\n--- step {step} ---")
+        print(f"  prompt: {prompt!r}")
+        print(f"  rewards: {rewards.tolist()}")
+        print(f"  reward mean: {rewards.mean().item():.3f}")
+        print(f"  advantage std: {advantage.std().item():.3f}")
+
+        
+        if epoch == epochs - 1:
+            print(f"  [final epoch] loss {loss.item():.4f} | ratio mean {ratio.mean().item():.4f} | kl {k1.mean().item():.4f}")
 
 
-for step in range(20):
-    train_steps()
+def train(n_steps=50):
+    for step in range(n_steps):
+        prompt = random.choice(prompts)
+        train_steps(prompt, step)
+
+train()
+
+print(f"\nfinal avg reward (last 10 steps): {sum(reward_log[-10:]) / 10:.3f}")
+print(f"full reward log: {[round(r, 3) for r in reward_log]}")
+
 
 '''Group-relative advantage. Added std normalization: advantage = (rewards - rewards.mean()) / (rewards.std() + 1e-8). 
 Produces z-scores per completion within the group — rewarded completions get positive advantage scaled by group spread,
