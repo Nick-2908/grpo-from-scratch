@@ -126,4 +126,4 @@ print([round(r, 3) for r in smoothed])
 '''Smoothed reward showed genuine learning (0.625 → 0.988 over 38 steps) followed by collapse (→ 0.637 over last 12 steps). 
 Classic reward hacking + policy collapse arc. Cause: length reward is easily hacked, and after enough steps the policy drifted too
  far from the reference for KL penalty at beta=0.04 to stabilize it. Fix: verifiable reward (Day 11) + potentially larger beta.'''
-#visualization in reward_hacking.img
+#visualization in images/07_reward_hacking.png
